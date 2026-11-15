@@ -9,7 +9,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -40,11 +40,18 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,6 +62,8 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
@@ -62,6 +71,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @Composable
 fun App() {
@@ -99,6 +110,7 @@ private data class SwipePattern(
 )
 
 private data class InboxItem(
+    val id: Int,
     val title: String,
     val meta: String,
     val preview: String
@@ -153,15 +165,16 @@ private val patterns = listOf(
 )
 
 private val inboxItems = listOf(
-    InboxItem("Design critique notes", "Today", "Review motion thresholds before posting the demo."),
-    InboxItem("KMP mini project backlog", "Tomorrow", "Order the next experiments by complexity and learning value."),
-    InboxItem("LinkedIn carousel draft", "Friday", "Frame the post around product tradeoffs, not just implementation.")
+    InboxItem(1, "Design critique notes", "Today", "Review motion thresholds before posting the demo."),
+    InboxItem(2, "KMP mini project backlog", "Tomorrow", "Order the next experiments by complexity and learning value."),
+    InboxItem(3, "LinkedIn carousel draft", "Friday", "Frame the post around product tradeoffs, not just implementation.")
 )
 
 @Composable
 private fun SwipeActionLab() {
     var selectedIndex by remember { mutableStateOf(0) }
-    var snackbarText by remember { mutableStateOf("Archived. Undo available.") }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
     val selected = patterns[selectedIndex]
 
     Box(Modifier.fillMaxSize()) {
@@ -178,7 +191,7 @@ private fun SwipeActionLab() {
             item {
                 PatternTabs(selectedIndex) {
                     selectedIndex = it
-                    snackbarText = "${patterns[it].title} ready. Try the card gesture."
+                    snackbarHostState.currentSnackbarData?.dismiss()
                 }
             }
             item {
@@ -189,7 +202,16 @@ private fun SwipeActionLab() {
                 ) { pattern ->
                     SwipePreview(
                         pattern = pattern,
-                        onAction = { snackbarText = "${pattern.action}. Undo available." }
+                        onAction = { item, undo ->
+                            scope.launch {
+                                snackbarHostState.currentSnackbarData?.dismiss()
+                                val result = snackbarHostState.showSnackbar(
+                                    message = "${pattern.action}: ${item.title}",
+                                    actionLabel = "UNDO"
+                                )
+                                if (result == SnackbarResult.ActionPerformed) undo()
+                            }
+                        }
                     )
                 }
             }
@@ -197,16 +219,26 @@ private fun SwipeActionLab() {
             item { Spacer(Modifier.height(74.dp)) }
         }
 
-        Snackbar(
+        SnackbarHost(
+            hostState = snackbarHostState,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
-                .padding(16.dp),
-            containerColor = Ink,
-            contentColor = Color.White,
-            action = { Text("UNDO", color = Color(0xFFFFD166), fontWeight = FontWeight.Black) }
-        ) {
-            Text(snackbarText, fontWeight = FontWeight.Bold)
+                .padding(16.dp)
+        ) { data ->
+            Snackbar(
+                containerColor = Ink,
+                contentColor = Color.White,
+                action = {
+                    data.visuals.actionLabel?.let { label ->
+                        TextButton(onClick = { data.performAction() }) {
+                            Text(label, color = Color(0xFFFFD166), fontWeight = FontWeight.Black)
+                        }
+                    }
+                }
+            ) {
+                Text(data.visuals.message, fontWeight = FontWeight.Bold)
+            }
         }
     }
 }
@@ -257,7 +289,11 @@ private fun PatternTabs(selectedIndex: Int, onSelected: (Int) -> Unit) {
 }
 
 @Composable
-private fun SwipePreview(pattern: SwipePattern, onAction: () -> Unit) {
+private fun SwipePreview(pattern: SwipePattern, onAction: (InboxItem, undo: () -> Unit) -> Unit) {
+    // Archive / Delete / Complete remove the card; Pin and Mute keep it and flag it.
+    val removes = pattern.mode != SwipeMode.Pin && pattern.mode != SwipeMode.Mute
+    var items by remember(pattern.mode) { mutableStateOf(inboxItems) }
+    var flagged by remember(pattern.mode) { mutableStateOf(emptySet<Int>()) }
     ElevatedCard(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
@@ -285,12 +321,33 @@ private fun SwipePreview(pattern: SwipePattern, onAction: () -> Unit) {
                 modifier = Modifier.fillMaxWidth()
             )
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                inboxItems.forEachIndexed { index, item ->
-                    SwipeCard(
-                        item = item,
-                        pattern = pattern,
-                        featured = index == 0,
-                        onAction = onAction
+                items.forEachIndexed { index, item ->
+                    key(item.id) {
+                        SwipeCard(
+                            item = item,
+                            pattern = pattern,
+                            featured = index == 0,
+                            flagged = item.id in flagged,
+                            removes = removes,
+                            onCommit = {
+                                if (removes) {
+                                    val before = items
+                                    items = items - item
+                                    onAction(item) { items = before }
+                                } else {
+                                    flagged = flagged + item.id
+                                    onAction(item) { flagged = flagged - item.id }
+                                }
+                            }
+                        )
+                    }
+                }
+                if (items.isEmpty()) {
+                    Text(
+                        text = "Inbox cleared. Use UNDO to bring the last card back.",
+                        color = Muted,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp)
                     )
                 }
             }
@@ -303,13 +360,33 @@ private fun SwipeCard(
     item: InboxItem,
     pattern: SwipePattern,
     featured: Boolean,
-    onAction: () -> Unit
+    flagged: Boolean,
+    removes: Boolean,
+    onCommit: () -> Unit
 ) {
-    var dragOffset by remember(pattern.mode) { mutableFloatStateOf(if (featured) -44f else 0f) }
-    val threshold = if (pattern.mode == SwipeMode.Delete) 150f else 118f
+    // Thresholds are expressed in dp so the gesture feels the same on every screen density.
+    val density = LocalDensity.current
+    val threshold = with(density) { (if (pattern.mode == SwipeMode.Delete) 150.dp else 118.dp).toPx() }
+    val restOffset = with(density) { (if (featured) (-20).dp else 0.dp).toPx() }
+    val maxLeft = with(density) { (-184).dp.toPx() }
+    val maxRight = with(density) { 42.dp.toPx() }
+    var cardWidth by remember { mutableFloatStateOf(0f) }
+    var dragOffset by remember(pattern.mode, featured) { mutableFloatStateOf(restOffset) }
+    var committed by remember(pattern.mode) { mutableStateOf(false) }
     val progress = (abs(dragOffset) / threshold).coerceIn(0f, 1f)
     val targetOffset = IntOffset(dragOffset.roundToInt(), 0)
     val animatedOffset by animateIntOffsetAsState(targetOffset, label = "card-offset")
+
+    // After a commit the card slides out (remove) or springs back (pin / mute) before the
+    // list is updated, so the gesture visibly resolves instead of freezing mid-way.
+    LaunchedEffect(committed) {
+        if (committed) {
+            delay(220)
+            committed = false
+            dragOffset = restOffset
+            onCommit()
+        }
+    }
     val actionAlpha by animateFloatAsState(if (progress > 0.12f) 1f else 0.45f, label = "action-alpha")
 
     Box(
@@ -339,19 +416,23 @@ private fun SwipeCard(
             modifier = Modifier
                 .fillMaxSize()
                 .offset { animatedOffset }
-                .pointerInput(pattern.mode) {
-                    detectDragGestures(
+                .onSizeChanged { cardWidth = it.width.toFloat() }
+                // Horizontal-only detector: vertical drags are left to the LazyColumn,
+                // so the list still scrolls when the finger starts on a card.
+                .pointerInput(pattern.mode, featured) {
+                    detectHorizontalDragGestures(
                         onDragEnd = {
-                            if (abs(dragOffset) >= threshold) {
-                                dragOffset = -96f
-                                onAction()
+                            if (abs(dragOffset) >= threshold && !committed) {
+                                dragOffset = if (removes) -cardWidth else restOffset
+                                committed = true
                             } else {
-                                dragOffset = if (featured) -44f else 0f
+                                dragOffset = restOffset
                             }
-                        }
+                        },
+                        onDragCancel = { dragOffset = restOffset }
                     ) { change, dragAmount ->
                         change.consume()
-                        dragOffset = (dragOffset + dragAmount.x).coerceIn(-184f, 42f)
+                        dragOffset = (dragOffset + dragAmount).coerceIn(maxLeft, maxRight)
                     }
                 },
             shape = RoundedCornerShape(18.dp),
@@ -372,7 +453,12 @@ private fun SwipeCard(
                         color = Ink,
                         fontWeight = FontWeight.Black
                     )
-                    Text(item.meta, color = Muted, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = if (flagged) pattern.title else item.meta,
+                        color = if (flagged) pattern.accent else Muted,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
                 Text(item.preview, color = Muted, lineHeight = 19.sp)
                 if (featured) {
